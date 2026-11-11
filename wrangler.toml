@@ -1,0 +1,39 @@
+name = "videochatroom"
+main = "src/worker.js"
+compatibility_date = "2025-09-01"
+account_id = "f57ee3b3ec6a868c05a73c1b2b54d531"
+workers_dev = false
+
+[assets]
+directory = "public"
+binding = "ASSETS"
+run_worker_first = true
+html_handling = "auto-trailing-slash"
+not_found_handling = "none"
+
+# 复用 chatroom 的账号 / 会话 / 房间登记 / 访问日志（同一个 Directory 实例）
+[[durable_objects.bindings]]
+name = "DIRECTORY"
+class_name = "Directory"
+script_name = "chatroom"
+
+# 每个视频房间一个：WebRTC 信令 + 房间内文字聊天
+[[durable_objects.bindings]]
+name = "VROOMS"
+class_name = "VideoRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["VideoRoom"]
+
+[[routes]]
+pattern = "videochatroom.xyzhzz.com"
+custom_domain = true
+
+[vars]
+COOKIE_DOMAIN = "xyzhzz.com"
+ALLOWED_ORIGINS = "https://videochatroom.xyzhzz.com"
+MAX_PEERS = "4"
+
+[observability]
+enabled = false
