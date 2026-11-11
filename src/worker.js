@@ -43,7 +43,65 @@ const SECURITY_HEADERS = {
   "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob: mediastream:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
 };
 
-const STUN = [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] }];
+// stun.miwifi.com（小米）在国内可达；Google STUN 在国内基本不可用，只作海外兜底
+const STUN = [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.miwifi.com:3478", "stun:stun.l.google.com:19302"] }];
+const TURN_TTL = 6 * 3600;
+const splitUrls = (v) => String(v || "").split(/[\s,]+/).map((x) => x.trim()).filter((x) => /^turns?:/.test(x));
+const noPort53 = (urls) => urls.filter((u) => !/:53(\?|$)/.test(u)); // 53 端口常被浏览器/网络拦截
+let meteredCache = null; // { at, list } — 同一 isolate 内缓存 10 分钟，避免每次进房都请求服务商
+
+// TURN 来源（按优先级，可同时配置多个，结果合并）：
+//  1) Cloudflare Realtime TURN：TURN_KEY_ID + TURN_KEY_API_TOKEN → 服务端签发短期凭据
+//  2) Metered / Open Relay：METERED_API_KEY + METERED_APP（xxx.metered.live 的 xxx）[+ METERED_REGION] → 服务端拉取 iceServers
+//  3) 自建 coturn（use-auth-secret）：TURN_URLS + TURN_SECRET → 本地用 HMAC-SHA1 签发限时凭据（密钥不下发浏览器）
+//  4) 固定账号（ExpressTURN 免费版等）：TURN_URLS + TURN_USERNAME + TURN_CREDENTIAL → 原样下发（TURN 协议本身需要浏览器持有该账号）
+async function iceServersFor(env, user) {
+  const iceServers = [...STUN], via = [];
+  if (env.TURN_KEY_ID && env.TURN_KEY_API_TOKEN) {
+    try {
+      const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.TURN_KEY_API_TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ ttl: TURN_TTL }),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        const list = Array.isArray(d.iceServers) ? d.iceServers : d.iceServers ? [d.iceServers] : [];
+        for (const s of list) {
+          const urls = noPort53((Array.isArray(s.urls) ? s.urls : [s.urls]).filter((u) => typeof u === "string" && u.startsWith("turn")));
+          if (urls.length) { iceServers.push({ urls, username: s.username, credential: s.credential }); via.push("cloudflare"); }
+        }
+      }
+    } catch {}
+  }
+  if (env.METERED_API_KEY && env.METERED_APP) {
+    try {
+      let list = meteredCache && Date.now() - meteredCache.at < 600000 ? meteredCache.list : null;
+      if (!list) {
+        const app = String(env.METERED_APP).replace(/^https?:\/\//, "").replace(/\.metered\.live.*$/, "");
+        if (/^[a-z0-9-]+$/i.test(app)) {
+          const q = new URLSearchParams({ apiKey: env.METERED_API_KEY }); if (env.METERED_REGION) q.set("region", env.METERED_REGION);
+          const r = await fetch(`https://${app}.metered.live/api/v1/turn/credentials?${q}`, { headers: { accept: "application/json" } });
+          if (r.ok) { const d = await r.json(); if (Array.isArray(d)) { list = d; meteredCache = { at: Date.now(), list }; } }
+        }
+      }
+      for (const s of list || []) {
+        const urls = noPort53((Array.isArray(s.urls) ? s.urls : [s.urls]).filter((u) => typeof u === "string" && u.startsWith("turn")));
+        if (urls.length && s.username && s.credential) { iceServers.push({ urls, username: s.username, credential: s.credential }); if (!via.includes("metered")) via.push("metered"); }
+      }
+    } catch {}
+  }
+  const urls = noPort53(splitUrls(env.TURN_URLS));
+  if (urls.length && env.TURN_SECRET) {
+    const username = `${Math.floor(Date.now() / 1000) + TURN_TTL}:u${user.id}`;
+    const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.TURN_SECRET), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
+    const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(username)));
+    iceServers.push({ urls, username, credential: btoa(String.fromCharCode(...sig)) }); via.push("coturn");
+  } else if (urls.length && env.TURN_USERNAME && env.TURN_CREDENTIAL) {
+    iceServers.push({ urls, username: env.TURN_USERNAME, credential: env.TURN_CREDENTIAL }); via.push("static");
+  }
+  return { iceServers, turn: via.length > 0, via };
+}
 
 export default {
   async fetch(req, env, ctx) {
@@ -103,31 +161,12 @@ async function api(req, env, url, ctx) {
     return map ? json({ avatars: map }) : err(401, "未登录");
   }
 
-  // ICE 服务器：STUN 免费公共；若配置了 Cloudflare Realtime TURN 密钥（secret），在服务端签发短期凭据
+  // ICE 服务器：免费公共 STUN + 可选 TURN（全部由 Worker secret 配置，换服务商不用改代码，见 iceServersFor）
   if (p === "/api/ice" && m === "GET") {
     const user = await D.getSession(token);
     if (!user) return err(401, "未登录");
-    const iceServers = [...STUN];
-    let turn = false;
-    if (env.TURN_KEY_ID && env.TURN_KEY_API_TOKEN) {
-      try {
-        const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${env.TURN_KEY_API_TOKEN}`, "content-type": "application/json" },
-          body: JSON.stringify({ ttl: 6 * 3600 }),
-        });
-        if (r.ok) {
-          const d = await r.json();
-          const list = Array.isArray(d.iceServers) ? d.iceServers : d.iceServers ? [d.iceServers] : [];
-          // 去掉 53 端口（浏览器常被拦），保留 TURN 部分
-          for (const s of list) {
-            const urls = (Array.isArray(s.urls) ? s.urls : [s.urls]).filter((u) => !/:53(\?|$)/.test(u));
-            if (urls.some((u) => u.startsWith("turn"))) { iceServers.push({ ...s, urls: urls.filter((u) => u.startsWith("turn")) }); turn = true; }
-          }
-        }
-      } catch {}
-    }
-    return json({ iceServers, turn });
+    const { iceServers, turn, via } = await iceServersFor(env, user);
+    return json({ iceServers, turn, via });
   }
 
   if (p === "/api/rooms" && m === "GET") {

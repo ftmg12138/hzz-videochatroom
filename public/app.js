@@ -264,71 +264,186 @@
   }
 
   // ----- WebRTC mesh -----
+  // 「完美协商」：两端都可以发起 offer，冲突时按 peerId 大小决定谁让步（polite 端回滚自己的 offer）。
+  // 连接看门狗：一定时间内没连上 / 断开超过几秒 → 由发起方做 ICE restart，最多 3 次，之后显示「连接失败，点击重试」。
+  const CFG = Object.assign({ connectMs: 12000, discMs: 5000, maxRestarts: 3 }, window.__vcCfg || {});
+  const BADGE = { new: "连接中", connecting: "连接中", disconnected: "网络不稳，重连中", failed: "连接失败", closed: "" };
   function trackFor(kind) { return kind === "audio" ? R.mic : (R.screen || R.cam); }
   function createPeer(peerId, username, initiator) {
     if (R.peers.has(peerId)) return R.peers.get(peerId);
-    const pc = new RTCPeerConnection({ iceServers: R.ice || [] });
-    const peer = { id: peerId, username, pc, initiator, queue: [], stream: new MediaStream(), restarted: 0, state: { audio: true, video: true } };
+    const peer = { id: peerId, username, state: { audio: true, video: true }, restarts: 0, resets: 0 };
     R.peers.set(peerId, peer);
     peer.tile = addTile(peerId, username, false);
-    peer.tile.querySelector("video").srcObject = peer.stream;
-    pc.onicecandidate = (e) => { if (e.candidate) wsSend({ type: "signal", to: peerId, data: { candidate: e.candidate } }); };
-    pc.ontrack = (e) => {
-      if (!peer.stream.getTracks().includes(e.track)) peer.stream.addTrack(e.track);
-      const v = peer.tile.querySelector("video"); v.srcObject = peer.stream; v.play().catch(() => {});
-    };
-    pc.onconnectionstatechange = () => {
-      const s = pc.connectionState;
-      const badge = peer.tile.querySelector(".conn");
-      badge.textContent = { new: "连接中", connecting: "连接中", connected: "", disconnected: "网络不稳", failed: "连接失败", closed: "" }[s] || s;
-      badge.classList.toggle("hidden", s === "connected" || s === "closed");
-      if (s === "failed" && peer.initiator && peer.restarted < 2) { peer.restarted++; makeOffer(peer, true); }
-    };
-    if (initiator) {
-      pc.addTransceiver("audio", { direction: "sendrecv" }).sender.replaceTrack(trackFor("audio"));
-      pc.addTransceiver("video", { direction: "sendrecv" }).sender.replaceTrack(trackFor("video"));
-      makeOffer(peer, false);
-    }
+    peer.tile.querySelector(".conn").onclick = () => { if (peer.gaveUp) resetPeer(peer, true); };
+    setupPc(peer, initiator);
+    applyQuality();
     return peer;
   }
-  async function makeOffer(peer, iceRestart) {
+  function setupPc(peer, initiator) {
+    const peerId = peer.id;
+    const pc = new RTCPeerConnection({ iceServers: R.ice || [], bundlePolicy: "max-bundle" });
+    Object.assign(peer, { pc, initiator, queue: [], stream: new MediaStream(), polite: String(R.myId) > String(peerId),
+      makingOffer: false, ignoreOffer: false, srdAnswerPending: false, gaveUp: false, net: "" });
+    const v = peer.tile.querySelector("video"); v.srcObject = peer.stream;
+    pc.onicecandidate = (e) => { if (e.candidate && peer.pc === pc) wsSend({ type: "signal", to: peerId, data: { candidate: e.candidate } }); };
+    pc.ontrack = (e) => {
+      if (peer.pc !== pc) return;
+      if (!peer.stream.getTracks().includes(e.track)) peer.stream.addTrack(e.track);
+      v.srcObject = peer.stream; v.play().catch(() => {});
+    };
+    pc.onnegotiationneeded = async () => {
+      if (peer.pc !== pc) return;
+      try {
+        peer.makingOffer = true;
+        await pc.setLocalDescription();
+        wsSend({ type: "signal", to: peerId, data: { sdp: pc.localDescription } });
+      } catch (e) { console.warn("offer", e); }
+      finally { peer.makingOffer = false; }
+    };
+    pc.onconnectionstatechange = () => { if (peer.pc === pc) onConnState(peer); };
+    pc.onsignalingstatechange = () => { if (peer.pc === pc && pc.signalingState === "stable") applyQuality(); };
+    if (initiator) {
+      // 发起方先建好收发通道，onnegotiationneeded 会自动发出 offer
+      pc.addTransceiver("audio", { direction: "sendrecv" }).sender.replaceTrack(trackFor("audio"));
+      pc.addTransceiver("video", { direction: "sendrecv" }).sender.replaceTrack(trackFor("video"));
+    }
+    setBadge(peer);
+    armWatch(peer, CFG.connectMs);
+  }
+  function setBadge(peer) {
+    const s = peer.pc.connectionState, badge = peer.tile.querySelector(".conn"), net = peer.tile.querySelector(".net");
+    badge.classList.toggle("retry", peer.gaveUp);
+    badge.textContent = peer.gaveUp ? "连接失败，点击重试" : (BADGE[s] ?? s);
+    badge.title = peer.gaveUp ? "点击重新建立与对方的连接" : "";
+    badge.classList.toggle("hidden", !peer.gaveUp && (s === "connected" || s === "closed"));
+    net.textContent = s === "connected" && peer.net ? peer.net : "";
+    net.title = s === "connected" ? (peer.net === "中继" ? "经 TURN 中继服务器转发" : "点对点直连") : "";
+  }
+  function armWatch(peer, ms) {
+    clearTimeout(peer.watchT);
+    peer.watchT = setTimeout(() => {
+      if (!R.peers.has(peer.id) || peer.pc.connectionState === "connected" || peer.gaveUp) return;
+      if (peer.initiator) iceRestart(peer);
+      else { wsSend({ type: "signal", to: peer.id, data: { restartReq: true } }); armWatch(peer, CFG.connectMs); }
+    }, ms);
+  }
+  function onConnState(peer) {
+    const s = peer.pc.connectionState;
+    if (s === "connected") { clearTimeout(peer.watchT); peer.restarts = 0; peer.gaveUp = false; checkNet(peer); applyQuality(); }
+    else if (s === "disconnected") armWatch(peer, CFG.discMs);
+    else if (s === "failed") { clearTimeout(peer.watchT); if (peer.initiator) iceRestart(peer); else armWatch(peer, 0); }
+    setBadge(peer);
+  }
+  function iceRestart(peer) {
+    if (peer.gaveUp || peer.pc.signalingState === "closed") return;
+    if (peer.restarts >= CFG.maxRestarts) return giveUp(peer, true);
+    peer.restarts++;
+    console.info(`ICE restart ${peer.restarts}/${CFG.maxRestarts} → ${peer.username}`);
+    try { peer.pc.restartIce(); } catch (e) { console.warn("restartIce", e); }
+    armWatch(peer, CFG.connectMs);
+  }
+  function giveUp(peer, notify) {
+    clearTimeout(peer.watchT);
+    peer.gaveUp = true; setBadge(peer);
+    if (notify) wsSend({ type: "signal", to: peer.id, data: { gaveUp: true } });
+  }
+  // 「点击重试」：两端都丢弃旧连接重建；点击的一方作为发起方
+  function resetPeer(peer, mine) {
+    clearTimeout(peer.watchT);
+    try { peer.pc.close(); } catch {}
+    if (mine) { peer.resetAt = Date.now(); wsSend({ type: "signal", to: peer.id, data: { reset: true } }); }
+    peer.resets++; peer.restarts = 0;
+    setupPc(peer, mine);
+    applyQuality();
+  }
+  async function checkNet(peer) {
     try {
-      const offer = await peer.pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
-      await peer.pc.setLocalDescription(offer);
-      wsSend({ type: "signal", to: peer.id, data: { sdp: peer.pc.localDescription } });
-    } catch (e) { console.warn("offer", e); }
+      const stats = await peer.pc.getStats(); let pairId = null; const by = new Map();
+      stats.forEach((r) => { by.set(r.id, r); if (r.type === "transport" && r.selectedCandidatePairId) pairId = r.selectedCandidatePairId; });
+      let pair = pairId && by.get(pairId);
+      if (!pair) stats.forEach((r) => { if (r.type === "candidate-pair" && r.state === "succeeded" && (r.nominated || r.selected) && !pair) pair = r; });
+      const l = pair && by.get(pair.localCandidateId), rm = pair && by.get(pair.remoteCandidateId);
+      if (!l) return;
+      peer.net = l.candidateType === "relay" || rm?.candidateType === "relay" ? "中继" : "直连";
+      setBadge(peer);
+    } catch {}
   }
   async function handleSignal(from, username, data) {
-    let peer = R.peers.get(from) || createPeer(from, username, false);
+    let peer = R.peers.get(from);
+    if (data.reset) {
+      // 对方要求重建。若我方刚刚也点了重试（同时点击），impolite 端保留自己的新连接，polite 端让步
+      if (peer && peer.resetAt && Date.now() - peer.resetAt < 3000 && !peer.polite) return;
+      if (peer) resetPeer(peer, false); else createPeer(from, username, false);
+      return;
+    }
+    if (!peer) { if (!data.sdp) return; peer = createPeer(from, username, false); }
     const pc = peer.pc;
     try {
+      if (data.restartReq) { if (peer.initiator && pc.connectionState !== "connected") { if (peer.restarts >= CFG.maxRestarts) giveUp(peer, true); else iceRestart(peer); } return; }
+      if (data.gaveUp) { if (pc.connectionState !== "connected") giveUp(peer, false); return; }
       if (data.sdp) {
-        await pc.setRemoteDescription(data.sdp);
-        if (data.sdp.type === "offer") {
+        const d = data.sdp;
+        const readyForOffer = !peer.makingOffer && (pc.signalingState === "stable" || peer.srdAnswerPending);
+        const collision = d.type === "offer" && !readyForOffer;
+        peer.ignoreOffer = !peer.polite && collision;
+        if (peer.ignoreOffer) return;
+        peer.srdAnswerPending = d.type === "answer";
+        await pc.setRemoteDescription(d); // polite 端遇到冲突时这里会隐式回滚自己的 offer
+        peer.srdAnswerPending = false;
+        if (d.type === "offer") {
           for (const t of pc.getTransceivers()) {
+            if (t.mid === null || t.currentDirection === "stopped") continue;
             const kind = t.receiver.track.kind;
-            t.direction = "sendrecv";
+            if (t.direction !== "sendrecv") t.direction = "sendrecv";
             await t.sender.replaceTrack(trackFor(kind));
           }
-          await pc.setLocalDescription(await pc.createAnswer());
+          await pc.setLocalDescription();
           wsSend({ type: "signal", to: from, data: { sdp: pc.localDescription } });
+          // 冲突回滚后，自己先前添加、未被协商的收发器不再需要（对方 offer 里已有音视频）
+          for (const t of pc.getTransceivers()) if (t.mid === null && t.currentDirection !== "stopped") { try { t.stop(); } catch {} }
         }
         for (const c of peer.queue.splice(0)) await pc.addIceCandidate(c).catch(() => {});
       } else if (data.candidate) {
-        if (pc.remoteDescription) await pc.addIceCandidate(data.candidate).catch(() => {});
-        else peer.queue.push(data.candidate);
+        if (pc.remoteDescription) { try { await pc.addIceCandidate(data.candidate); } catch (e) { if (!peer.ignoreOffer) console.debug("candidate", e); } }
+        else if (!peer.ignoreOffer) peer.queue.push(data.candidate);
       }
     } catch (e) { console.warn("signal", e); }
+  }
+  // 码率与采集：2 人约 500 kbps，3–4 人约 300 kbps；屏幕共享给更高码率并优先清晰度
+  let qualityT = null;
+  function applyQuality() { clearTimeout(qualityT); qualityT = setTimeout(applyQualityNow, 50); }
+  async function applyQualityNow() {
+    const n = R.peers.size + 1, many = n > 2;
+    const maxBitrate = R.screen ? (many ? 600000 : 1000000) : (many ? 300000 : 500000);
+    const pref = R.screen ? "maintain-resolution" : "balanced";
+    for (const p of R.peers.values()) {
+      for (const t of p.pc.getTransceivers()) {
+        if (t.mid === null || t.currentDirection === "stopped" || t.receiver.track.kind !== "video") continue;
+        const sp = t.sender.getParameters();
+        if (!sp.encodings || !sp.encodings.length) continue; // 尚未协商完成，稍后 stable 时再设
+        if (sp.encodings[0].maxBitrate === maxBitrate && sp.degradationPreference === pref) continue;
+        sp.encodings[0].maxBitrate = maxBitrate; sp.degradationPreference = pref;
+        try { await t.sender.setParameters(sp); }
+        catch { try { const q = t.sender.getParameters(); if (q.encodings?.length) { q.encodings[0].maxBitrate = maxBitrate; await t.sender.setParameters(q); } } catch {} }
+      }
+    }
+    if (R.cam && R.cam.readyState === "live" && R.camMany !== many) {
+      R.camMany = many;
+      R.cam.applyConstraints(many ? { width: { ideal: 480 }, height: { ideal: 360 }, frameRate: { ideal: 20, max: 20 }, facingMode: R.facing }
+        : { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 24, max: 30 }, facingMode: R.facing }).catch(() => {});
+    }
   }
   function replaceVideoTrack() {
     for (const p of R.peers.values()) for (const t of p.pc.getTransceivers()) {
       if (t.receiver.track.kind === "video" && t.currentDirection !== "stopped") t.sender.replaceTrack(trackFor("video")).catch(() => {});
     }
+    applyQuality();
   }
   function removePeer(id) {
     const p = R.peers.get(id); if (!p) return;
+    clearTimeout(p.watchT);
     try { p.pc.close(); } catch {}
-    p.tile.remove(); R.peers.delete(id); layout();
+    p.tile.remove(); R.peers.delete(id); layout(); applyQuality();
   }
   function closeAllPeers() { for (const id of [...R.peers.keys()]) removePeer(id); updateCount(); }
   function applyState(peer, s) {
@@ -346,7 +461,7 @@
     d.dataset.peer = id;
     d.innerHTML = `<video autoplay playsinline ${local ? "muted" : ""}></video>
       <div class="off hidden">${avatar(uname)}</div>
-      <div class="conn ${local ? "hidden" : ""}">连接中</div>
+      <div class="conn ${local ? "hidden" : ""}">连接中</div><div class="net"></div>
       <div class="name"><b class="mic"></b><span></span></div>`;
     d.querySelector(".name span").textContent = name;
     d.querySelector(".name").insertAdjacentHTML("afterbegin", avatar(uname, true));
@@ -386,7 +501,7 @@
       const t = kind === "audio" ? s.getAudioTracks()[0] : s.getVideoTracks()[0];
       if (!R.local) R.local = new MediaStream();
       R.local.addTrack(t);
-      if (kind === "audio") R.mic = t; else R.cam = t;
+      if (kind === "audio") R.mic = t; else { R.cam = t; R.camMany = undefined; applyQuality(); }
       for (const p of R.peers.values()) for (const tr of p.pc.getTransceivers()) {
         if (tr.receiver.track.kind === kind && !(kind === "video" && R.screen)) tr.sender.replaceTrack(t).catch(() => {});
       }
@@ -408,7 +523,7 @@
     R.facing = R.facing === "user" ? "environment" : "user";
     try {
       const s = await getMedia(true, false); const t = s.getVideoTracks()[0];
-      R.cam.stop(); R.cam = t; t.enabled = R.camOn;
+      R.cam.stop(); R.cam = t; t.enabled = R.camOn; R.camMany = undefined; applyQuality();
       if (!R.screen) replaceVideoTrack();
       updateLocalTile();
       $('.tile[data-peer="local"]').classList.toggle("local", R.facing === "user");

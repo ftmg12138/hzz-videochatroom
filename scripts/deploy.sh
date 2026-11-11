@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 部署 Worker「videochatroom」→ https://videochatroom.xyzhzz.com
 # 依赖：chatroom Worker 已部署（这里通过 script_name 绑定它的 Directory DO）。需要 CLOUDFLARE_API_TOKEN。
-# TURN（可选）：设置 secret TURN_KEY_ID / TURN_KEY_API_TOKEN 后，/api/ice 会在服务端签发 Cloudflare Realtime TURN 凭据。
+# TURN（可选）：见 README「NAT 穿透」——Cloudflare / Metered / 自建 coturn / 固定账号，均通过 Worker secret 配置。
 set -euo pipefail
 : "${CLOUDFLARE_API_TOKEN:?请先设置 CLOUDFLARE_API_TOKEN}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -37,14 +37,21 @@ WebRTC mesh 视频房间（2–4 人），纯 Cloudflare：Worker + Durable Obje
 本地预览（不碰线上数据）：在两个项目里各放一个 `.dev.vars`（已被 git 忽略），设置 `COOKIE_DOMAIN=""`，并把 `ALLOWED_ORIGINS` 设成 wrangler dev 改写后的来源（`http://chatroom.xyzhzz.com` / `https://videochatroom.xyzhzz.com` 等），然后
 `npx wrangler dev -c wrangler.toml -c ../videochatroom/wrangler.toml --port 8799 --persist-to /tmp/state`（视频站则反过来，加 `--upstream-protocol https`）。两个独立的 wrangler dev 会话之间不支持 DO RPC，所以要用多配置的单一会话。
 
-## NAT 穿透
-- 默认：STUN（stun.cloudflare.com、stun.l.google.com）
-- TURN（可选）：设置 Worker secret `TURN_KEY_ID`、`TURN_KEY_API_TOKEN`（Cloudflare Realtime → TURN Server 里创建的密钥），
-  `/api/ice` 会在服务端调用 `rtc.live.cloudflare.com/v1/turn/keys/<id>/credentials/generate-ice-servers` 签发 6 小时有效的凭据，前端无需改动。
+## NAT 穿透与连接健壮性
+- 默认：STUN（stun.cloudflare.com、stun.miwifi.com、stun.l.google.com）
+- TURN（可选，全部用 Worker secret 配置，换服务商不用改代码；可同时配置多个，结果合并）：
+  1. Cloudflare Realtime TURN：`TURN_KEY_ID` + `TURN_KEY_API_TOKEN` → 服务端签发 6 小时凭据（需绑卡）
+  2. Metered（免费版 / Open Relay）：`METERED_API_KEY` + `METERED_APP`（`xxx.metered.live` 里的 `xxx`），可选 `METERED_REGION` → 服务端拉取 iceServers（缓存 10 分钟）
+  3. 自建 coturn（`use-auth-secret`）：`TURN_URLS` + `TURN_SECRET` → Worker 用 HMAC-SHA1 签发 6 小时限时凭据，密钥不下发浏览器
+  4. 固定账号（如 ExpressTURN 免费版）：`TURN_URLS` + `TURN_USERNAME` + `TURN_CREDENTIAL`（TURN 协议要求浏览器持有该账号）
+  `TURN_URLS` 用逗号或空格分隔，例如 `turn:turn.example.com:3478?transport=udp,turns:turn.example.com:443?transport=tcp`。
   ```bash
-  printf '%s' "<Key ID>" | npx wrangler secret put TURN_KEY_ID
-  printf '%s' "<API Token>" | npx wrangler secret put TURN_KEY_API_TOKEN
+  printf '%s' "<值>" | npx wrangler secret put METERED_API_KEY   # 其他同理，不要把值写进命令历史或仓库
   ```
+- 前端（public/app.js）：完美协商（polite/impolite 按 peerId 比较，双方同时 offer 不会卡住）；
+  12 秒未连上或断开超过 5 秒 → 发起方 ICE restart，最多 3 次，之后显示「连接失败，点击重试」，点击后两端重建连接；
+  视频上行 2 人约 500 kbps、3–4 人约 300 kbps（3 人以上采集降到 480×360@20）；连上后画面右下角小字显示「直连 / 中继」。
+- 测试：`MAINT_TOKEN_FILE=... [LOCAL=1] node test/restart.mjs`（LOCAL=1 用本地前端文件替换线上文件，部署前验证）
 
 ## 部署 / 测试 / 备份
 ```bash
