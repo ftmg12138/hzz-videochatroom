@@ -11,7 +11,9 @@
   }
   function route() {
     if (me) avSet(me.username, me.avatar);
+    window.__me = me;
     if (!me) { leaveRoom(true); show("v-auth"); return; }
+    syncSkin(me);
     if (me.mustChange) { leaveRoom(true); $("#c-cancel").classList.add("hidden"); show("v-chpw"); return; }
     const m = location.hash.match(/^#\/room\/(.+)$/);
     if (m) {
@@ -59,21 +61,33 @@
 
   // ===== 大厅 =====
   let pubTimer = null;
+  let myList = [], pubList = [];
+  const V = { kind: "video" };
+  function lobbyStats() {
+    $("#st-online").textContent = pubList.reduce((a, r) => a + (r.online || 0), 0);
+    $("#st-my").textContent = myList.length; $("#st-pub").textContent = pubList.length;
+    $("#st-own").textContent = myList.filter((r) => r.creator_name === me.username).length;
+    $("#l-feed").innerHTML = Lobby.feed(myList, pubList);
+  }
+  function renderMy() {
+    const box = $("#l-rooms");
+    box.innerHTML = myList.length ? Lobby.cards(myList, "my", V) : `<div class="empty">还没有视频房间。创建一个，或用房间号和密码加入 ✨</div>`;
+    $$("[data-leave]", box).forEach((b) => b.onclick = async () => {
+      if (!confirm("从列表移除该房间？之后再进需要重新输入房间密码或重新申请。")) return;
+      await api("/api/rooms/leave", { method: "POST", body: { number: b.dataset.leave } }); lobby();
+    });
+  }
   async function lobby() {
     $("#l-name").textContent = me.username;
     $("#l-av").innerHTML = `<button class="av-me" id="l-avbtn" type="button" title="设置头像">${avatar(me.username)}</button>`;
     $("#l-avbtn").onclick = pickAvatar;
-    const ul = $("#l-rooms");
+    $("#l-admin")?.classList.toggle("hidden", !me.isAdmin);
     try {
       const { rooms } = await api("/api/rooms");
+      const m = new Map(pubList.map((r) => [r.number, r]));
+      myList = rooms.map((r) => (m.has(r.number) ? { ...r, online: m.get(r.number).online } : r));
       $("#l-rooms-n").textContent = rooms.length;
-      ul.innerHTML = rooms.length ? rooms.map((r) => `<li><div class="row"><span class="ico-room v">${r.visibility === "public" ? "🌿" : "🎥"}</span><div><div class="title">${esc(r.name || r.number)}</div><div class="sub">房间号 ${esc(r.number)} · 房主 ${esc(r.creator_name || "—")}</div></div></div>
-        <div class="row nogrow"><a class="btn sm" href="#/room/${encodeURIComponent(r.number)}">进入</a><button class="btn ghost sm" data-leave="${esc(r.number)}">移除</button></div></li>`).join("")
-        : `<li class="empty">还没有视频房间。创建一个，或用房间号和密码加入 ✨</li>`;
-      $$("[data-leave]", ul).forEach((b) => b.onclick = async () => {
-        if (!confirm("从列表移除该房间？之后再进需要重新输入房间密码或重新申请。")) return;
-        await api("/api/rooms/leave", { method: "POST", body: { number: b.dataset.leave } }); lobby();
-      });
+      renderMy(); Lobby.search(); lobbyStats();
     } catch (er) { if (er.status === 401) { me = null; route(); return; } }
     publicRooms();
   }
@@ -84,18 +98,16 @@
     if ($("#v-lobby").classList.contains("hidden")) return;
     try {
       const { rooms } = await api("/api/rooms/public");
+      pubList = rooms;
       $("#l-pub-n").textContent = rooms.length;
-      $("#l-pub").innerHTML = rooms.length ? rooms.map((r) => `<div class="room-card">
-          <div class="rc-top"><span class="ico-room v">🎥</span><div class="col"><div class="rc-name">${esc(r.name || r.number)}</div><div class="sub">房间号 ${esc(r.number)} · <span class="tag vid">视频</span></div></div></div>
-          <div class="rc-meta"><span><span class="live-dot"></span>${r.online || 0}/4 人在线</span><span>👤 房主 ${esc(r.creator_name || "—")}</span></div>
-          ${r.member ? `<a class="btn sm" href="#/room/${encodeURIComponent(r.number)}">进入</a>`
-            : r.pending ? `<button class="btn soft sm" disabled>已申请，等待房主同意</button>`
-            : `<button class="btn soft sm" data-req="${esc(r.number)}">申请加入</button>`}
-        </div>`).join("") : `<div class="empty">还没有公开视频房间。创建房间时选「公开」，就会出现在这里。</div>`;
+      $("#l-pub").innerHTML = rooms.length ? Lobby.cards(rooms, "pub", V) : `<div class="empty">还没有公开视频房间。创建房间时选「公开」，就会出现在这里。</div>`;
       $$("[data-req]").forEach((b) => b.onclick = () => busy(b, async () => {
         try { const d = await api("/api/rooms/request", { method: "POST", body: { number: b.dataset.req } }); if (d.member) location.hash = "#/room/" + encodeURIComponent(b.dataset.req); else { toast("已发送申请，房主同意后即可进入"); publicRooms(); } }
         catch (er) { toast(er.message); }
       }));
+      const m = new Map(rooms.map((r) => [r.number, r]));
+      if (myList.some((r) => m.has(r.number) && r.online !== m.get(r.number).online)) { myList = myList.map((r) => (m.has(r.number) ? { ...r, online: m.get(r.number).online } : r)); renderMy(); }
+      Lobby.search(); lobbyStats();
       if (rooms.some((r) => r.pending)) pubTimer = setTimeout(() => { if (!$("#v-lobby").classList.contains("hidden")) lobby(); }, 5000);
     } catch {}
   }
@@ -203,7 +215,7 @@
   function connect() {
     const room = R.room;
     status("连接中…");
-    const ws = new WebSocket(`wss://${location.host}/api/rooms/${encodeURIComponent(room)}/ws`);
+    const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/rooms/${encodeURIComponent(room)}/ws`);
     R.ws = ws;
     let opened = false;
     ws.onopen = () => { opened = true; R.retry = 0; clearInterval(R.pingT); R.pingT = setInterval(() => ws.readyState === 1 && ws.send('{"type":"ping"}'), 25000); };
