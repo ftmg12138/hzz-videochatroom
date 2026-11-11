@@ -7,18 +7,19 @@ import { chromium } from "playwright-core";
 import { nodePeer } from "./webrtc-node.mjs";
 const V = process.env.BASE || "https://videochatroom.xyzhzz.com";
 const C = process.env.CHAT_BASE || "https://chatroom.xyzhzz.com";
-const ADMIN_PW = fs.readFileSync(process.env.ADMIN_PW_FILE || "/workspace/.secrets/chatroom-admin-init", "utf8").replace(/[\r\n]/g, "");
+const MAINT = process.env.MAINT_TOKEN_FILE ? fs.readFileSync(process.env.MAINT_TOKEN_FILE, "utf8").trim() : null;
+const ADMIN_PW = MAINT ? null : fs.readFileSync(process.env.ADMIN_PW_FILE || "/workspace/.secrets/chatroom-admin-init", "utf8").replace(/[\r\n]/g, "");
 const sfx = Math.random().toString(36).slice(2, 7);
 let pass = 0, failN = 0;
 const ok = (c, name) => { if (c) { pass++; console.log("  ✓", name); } else { failN++; console.log("  ✗", name); } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function client(base) {
+function client(base, extra = {}) {
   let cookie = "";
   return {
     get token() { return cookie.split("=")[1]; }, set cookie(v) { cookie = v; }, get cookie() { return cookie; },
     async req(path, method = "GET", body, b = base) {
-      const h = { Origin: b };
+      const h = { Origin: b, ...extra };
       if (cookie) h.Cookie = cookie;
       if (body !== undefined) h["content-type"] = "application/json";
       const r = await fetch(b + path, { method, headers: h, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -37,7 +38,7 @@ function client(base) {
 const wsOpen = (ws) => new Promise((res) => { ws.once("open", () => res(true)); ws.once("unexpected-response", (_q, r) => res(r.statusCode)); ws.once("error", () => res(false)); });
 async function waitFor(ws, pred, ms = 6000) { const t = Date.now(); while (Date.now() - t < ms) { const m = ws.msgs.find(pred); if (m) return m; await sleep(100); } return null; }
 
-const a = client(V), b = client(V), anon = client(V), adm = client(C);
+const a = client(V), b = client(V), anon = client(V), adm = client(C, MAINT ? { "X-Maint-Token": MAINT } : {});
 const na = `va_${sfx}`, nb = `vb_${sfx}`, room = `vtest-${sfx}`, textRoom = `ttest-${sfx}`;
 const PW = "Video-pass-" + sfx, RPW = "vr-" + sfx;
 const ADMIN_TMP = "Tmp-Admin-" + Math.random().toString(36).slice(2) + "#5";
@@ -54,8 +55,10 @@ r = await a.req("/api/ice"); ok(r.status === 200 && r.data.iceServers.length >= 
 const turn = r.data.turn;
 r = await a.req("/api/rooms", "POST", { number: room, password: RPW, name: "视频测试" }); ok(r.status === 200, "A 创建视频房间");
 r = await a.req("/api/rooms", "POST", { number: textRoom, password: RPW }, C); ok(r.status === 200, "A 在 chatroom 创建文字房间");
-r = await b.req("/api/rooms/join", "POST", { number: textRoom, password: RPW }); ok(r.status === 400, "文字房间号不能在视频站加入");
-r = await b.req("/api/rooms/join", "POST", { number: room, password: RPW }, C); ok(r.status === 400, "视频房间号不能在文字站加入");
+r = await b.req("/api/rooms/join", "POST", { number: textRoom, password: RPW }); ok(r.status === 403, "文字房间号在视频站不存在（命名空间独立）");
+r = await b.req("/api/rooms/join", "POST", { number: room, password: RPW }, C); ok(r.status === 403, "视频房间号在文字站不存在（命名空间独立）");
+r = await a.req("/api/rooms", "POST", { number: room, password: RPW, name: "同号文字房" }, C); ok(r.status === 200, "同一房间号可同时存在视频房和文字房");
+r = await a.req("/api/rooms", "POST", { number: room, password: RPW }); ok(r.status === 409, "同类型同号房间不能重复创建");
 let w = b.ws(room); ok((await wsOpen(w)) === 403, "未凭密码加入时信令 WebSocket 被拒"); w.terminate();
 w = anon.ws(room); ok((await wsOpen(w)) === 403, "未登录信令 WebSocket 被拒"); w.terminate();
 r = await b.req("/api/rooms/join", "POST", { number: room, password: "wrong-pw" }); ok(r.status === 403, "错误房间密码被拒");
@@ -132,11 +135,12 @@ socks.forEach((s) => s.close()); s5.terminate();
 await sleep(1000);
 
 console.log("管理后台（chatroom /admin）");
-r = await adm.req("/api/login", "POST", { username: "xyzhzzmaster", password: ADMIN_PW });
+r = MAINT ? { status: 200, data: { user: { mustChange: true } } } : await adm.req("/api/login", "POST", { username: "xyzhzzmaster", password: ADMIN_PW });
 if (!(r.status === 200 && r.data.user.mustChange)) {
   console.log("  ! 管理员已不是初始密码状态，跳过后台检查（测试数据需手动清理）");
 } else {
-  r = await adm.req("/api/password", "POST", { oldPassword: ADMIN_PW, newPassword: ADMIN_TMP }); ok(r.status === 200, "临时改密进入后台");
+  if (!MAINT) { r = await adm.req("/api/password", "POST", { oldPassword: ADMIN_PW, newPassword: ADMIN_TMP }); ok(r.status === 200, "临时改密进入后台"); }
+  else { r = await adm.req("/api/admin/logs?limit=1"); ok(r.status === 200, "维护令牌进入后台（管理员密码未动）"); }
   r = await adm.req(`/api/admin/logs?scope=video&room=${room}&limit=200`);
   const evs = new Set(r.data.rows.map((x) => x.event));
   ok(r.status === 200 && ["video_room_create", "video_join", "video_join_fail", "video_connect", "video_leave"].every((e) => evs.has(e)), "视频事件写入访问日志：" + [...evs].join(","));
@@ -144,9 +148,9 @@ if (!(r.status === 200 && r.data.user.mustChange)) {
   r = await adm.req(`/api/admin/logs?scope=text&room=${room}`); ok(r.status === 200 && r.data.rows.every((x) => !x.event.startsWith("video_")), "文字筛选不含视频事件");
   r = await adm.req(`/api/admin/logs?event=video_visit&limit=3`); ok(r.status === 200 && r.data.rows.length > 0, "视频站页面访问已记录");
   r = await adm.req("/api/admin/rooms?q=" + sfx);
-  const vr = r.data.rows.find((x) => x.number === room), tr = r.data.rows.find((x) => x.number === textRoom);
-  ok(vr && vr.kind === "video" && vr.messages >= 1 && tr && tr.kind === "text", "后台房间列表区分视频/文字，并读取视频房间消息数");
-  r = await adm.req(`/api/admin/rooms/${room}/messages`); ok(r.status === 200 && r.data.rows.some((x) => x.text.includes("视频里的文字消息")), "后台查看视频房间聊天");
+  const vr = r.data.rows.find((x) => x.number === room && x.kind === "video"), tr = r.data.rows.find((x) => x.number === textRoom && x.kind === "text"), tr2 = r.data.rows.find((x) => x.number === room && x.kind === "text");
+  ok(vr && vr.kind === "video" && vr.messages >= 1 && tr && tr2, "后台房间列表区分视频/文字（同号两种房间并存），并读取视频房间消息数");
+  r = await adm.req(`/api/admin/rooms/video/${room}/messages`); ok(r.status === 200 && r.data.rows.some((x) => x.text.includes("视频里的文字消息")), "后台查看视频房间聊天");
   // 踢人 / 封禁
   const wb = b.ws(room); await wsOpen(wb); await waitFor(wb, (m) => m.type === "welcome");
   r = await adm.req("/api/admin/users?q=" + sfx);
@@ -155,16 +159,19 @@ if (!(r.status === 200 && r.data.user.mustChange)) {
   ok(r.status === 200 && !!(await waitFor(wb, (m) => m.type === "kicked")), "封禁用户会把他踢出视频房间");
   r = await b.req("/api/me"); ok(r.status === 401, "封禁后视频站会话失效");
   const wa = a.ws(room); await wsOpen(wa); await waitFor(wa, (m) => m.type === "welcome");
-  r = await adm.req(`/api/admin/rooms/${room}/messages`, "DELETE"); ok(r.status === 200 && !!(await waitFor(wa, (m) => m.type === "chat-cleared")), "后台清空视频房间聊天");
-  r = await adm.req(`/api/admin/rooms/${room}`, "DELETE"); ok(r.status === 200 && !!(await waitFor(wa, (m) => m.type === "kicked")), "删除视频房间并移出在线成员");
+  r = await adm.req(`/api/admin/rooms/video/${room}/messages`, "DELETE"); ok(r.status === 200 && !!(await waitFor(wa, (m) => m.type === "chat-cleared")), "后台清空视频房间聊天");
+  r = await adm.req(`/api/admin/rooms/video/${room}`, "DELETE"); ok(r.status === 200 && !!(await waitFor(wa, (m) => m.type === "kicked")), "删除视频房间并移出在线成员");
   wa.terminate(); wb.terminate();
   console.log("清理");
-  r = await adm.req(`/api/admin/rooms/${textRoom}`, "DELETE"); ok(r.status === 200, "删除测试文字房间");
+  r = await adm.req(`/api/admin/rooms/text/${textRoom}`, "DELETE"); ok(r.status === 200, "删除测试文字房间");
+  r = await adm.req(`/api/admin/rooms/text/${room}`, "DELETE"); ok(r.status === 200, "删除同号测试文字房间");
   for (const id of [idA, idB]) { r = await adm.req(`/api/admin/users/${id}`, "DELETE"); ok(r.status === 200, "删除测试用户 " + id); }
   r = await adm.req("/api/admin/users?q=" + sfx); ok(r.data.rows.length === 0, "测试用户已清除");
   r = await adm.req("/api/admin/rooms?q=" + sfx); ok(r.data.rows.length === 0, "测试房间已清除");
-  r = await adm.req("/api/password", "POST", { oldPassword: ADMIN_TMP, newPassword: ADMIN_PW }); ok(r.status === 200, "管理员密码改回初始值（随后运行 reset-admin.sh 恢复强制改密）");
-  await adm.req("/api/logout", "POST");
+  if (!MAINT) {
+    r = await adm.req("/api/password", "POST", { oldPassword: ADMIN_TMP, newPassword: ADMIN_PW }); ok(r.status === 200, "管理员密码改回初始值（随后运行 reset-admin.sh 恢复强制改密）");
+    await adm.req("/api/logout", "POST");
+  }
 }
 console.log(`\n通过 ${pass}，失败 ${failN}`);
 process.exit(failN ? 1 : 0);

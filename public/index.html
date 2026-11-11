@@ -4,30 +4,35 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>HZZ 视频聊天室</title>
-<meta name="theme-color" content="#161923">
+<meta name="theme-color" content="#f5f4fb">
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="/style.css?v=2">
+<script src="/theme.js?v=7"></script>
+<link rel="stylesheet" href="/style.css?v=7">
 </head>
 <body>
 <section id="v-auth" class="wrap hidden">
-  <div class="brand"><div class="logo v">视</div><h1>HZZ 视频聊天室</h1></div>
+  <div class="brand"><div class="logo v">视</div><h1>HZZ 视频聊天室<span class="tagline">面对面，更亲近</span></h1></div>
   <div class="card">
     <p class="notice mt0">与 <a href="https://chatroom.xyzhzz.com/">HZZ 聊天室</a> 共用账号，已有账号直接登录。</p>
     <div class="tabs"><button data-tab="login" class="on">登录</button><button data-tab="register">注册</button></div>
     <form id="f-auth" autocomplete="on">
       <label for="a-user">用户名</label>
-      <input id="a-user" autocomplete="username" required maxlength="20" placeholder="3–20 位，中文/字母/数字/下划线">
+      <input id="a-user" autocomplete="username" required maxlength="20" placeholder="3–20 位，中文 / 字母 / 数字 / 下划线">
       <label for="a-pass">密码</label>
       <input id="a-pass" type="password" autocomplete="current-password" required maxlength="128" placeholder="至少 8 位">
       <div id="reg-extra" class="hidden">
         <label for="a-pass2">确认密码</label>
-        <input id="a-pass2" type="password" autocomplete="new-password" maxlength="128">
-        <div class="notice">🔒 安全提示：为防范滥用，本站会记录登录、注册和进出房间时的 IP 地址、所在地区与浏览器信息，仅用于安全审计。继续注册即表示你同意上述记录。</div>
+        <input id="a-pass2" type="password" autocomplete="new-password" maxlength="128" placeholder="再输入一次">
+        <div id="code-wrap" class="hidden">
+          <label for="a-code">注册口令</label>
+          <input id="a-code" autocomplete="off" maxlength="64" placeholder="管理员已开启口令注册，请向管理员索取">
+        </div>
       </div>
       <button class="btn block" id="a-submit" type="submit">登录</button>
       <div class="msg" id="a-msg"></div>
     </form>
   </div>
+  <p class="sub foot"><a href="https://chatroom.xyzhzz.com/">← 文字聊天室</a> · <button class="btn ghost sm theme-btn" data-theme-toggle type="button">🌙</button></p>
 </section>
 
 <section id="v-chpw" class="wrap hidden">
@@ -47,28 +52,43 @@
 
 <section id="v-lobby" class="hidden">
   <div class="top">
-    <div class="who">你好，<b id="l-name"></b></div>
+    <div class="who"><span id="l-av"></span><span class="hello-txt">你好，<b id="l-name"></b></span></div>
     <div class="row nogrow">
-      <a class="btn ghost sm" href="https://chatroom.xyzhzz.com/">文字聊天室</a>
+      <a class="btn ghost sm" href="https://chatroom.xyzhzz.com/">文字</a>
+      <button class="btn ghost sm icon theme-btn" data-theme-toggle>🌙</button>
+      <button class="btn ghost sm" id="l-avatar">头像</button>
       <button class="btn ghost sm" id="l-pw">改密码</button>
       <button class="btn ghost sm" id="l-logout">退出</button>
     </div>
   </div>
-  <div class="wrap">
-    <div class="card">
-      <div class="tabs"><button data-rtab="join" class="on">加入视频房间</button><button data-rtab="create">创建视频房间</button></div>
-      <form id="f-room" autocomplete="off">
-        <label>房间号</label><input id="r-num" required maxlength="20" placeholder="3–20 位，字母/数字/-/_" autocapitalize="off">
-        <label>房间密码</label><input id="r-pass" type="password" required maxlength="64" autocomplete="new-password" placeholder="4–64 位">
-        <div id="r-create-extra" class="hidden"><label>房间名称（可选）</label><input id="r-name" maxlength="30" placeholder="例如：周末视频"></div>
-        <button class="btn block" id="r-submit" type="submit">加入</button>
-        <div class="msg" id="r-msg"></div>
-      </form>
-      <p class="notice">每个房间最多 4 人，视频点对点直连，不经过服务器。</p>
+  <div class="wrap wide">
+    <div class="grid2">
+      <div class="card">
+        <div class="tabs"><button data-rtab="join" class="on">加入私密房间</button><button data-rtab="create">创建视频房间</button></div>
+        <form id="f-room" autocomplete="off">
+          <div id="r-vis-wrap" class="hidden">
+            <label>房间类型</label>
+            <div class="seg">
+              <label><input type="radio" name="r-vis" value="private" checked><span>🔒 私密<small>凭房间号 + 密码进入，不在大厅显示</small></span></label>
+              <label><input type="radio" name="r-vis" value="public"><span>🌿 公开<small>显示在大厅，别人可申请加入</small></span></label>
+            </div>
+          </div>
+          <label>房间号</label><input id="r-num" required maxlength="20" placeholder="3–20 位，字母 / 数字 / - / _" autocapitalize="off">
+          <label id="r-pass-label">房间密码</label><input id="r-pass" type="password" maxlength="64" autocomplete="new-password" placeholder="4–64 位">
+          <div id="r-create-extra" class="hidden"><label>房间名称（可选）</label><input id="r-name" maxlength="30" placeholder="例如：周末视频"></div>
+          <button class="btn block" id="r-submit" type="submit">加入</button>
+          <div class="msg" id="r-msg"></div>
+        </form>
+        <p class="notice">每个房间最多 4 人，视频点对点直连，不经过服务器。视频房间号和文字房间号互相独立。</p>
+      </div>
+      <div class="card">
+        <h2>我的视频房间 <span class="count" id="l-rooms-n">0</span></h2>
+        <ul class="list" id="l-rooms"></ul>
+      </div>
     </div>
     <div class="card">
-      <h2>我的视频房间</h2>
-      <ul class="list" id="l-rooms"></ul>
+      <h2>🌿 公开视频房间 <span class="count" id="l-pub-n">0</span></h2>
+      <div class="rooms" id="l-pub"></div>
     </div>
   </div>
 </section>
@@ -90,7 +110,9 @@
 
 <section id="v-room" class="vroom hidden">
   <div class="top">
+    <button class="btn ghost sm" id="vr-back">‹ 大厅</button>
     <div class="center-col"><div class="title" id="vr-title"></div><div class="status" id="vr-status">连接中…</div></div>
+    <div class="row nogrow"><button class="btn ghost sm hidden" id="rq-btn" title="加入申请">📨 <span class="badge-n hidden" id="rq-n">0</span></button></div>
   </div>
   <div class="vbody">
     <div class="grid" id="vr-grid"></div>
@@ -108,9 +130,13 @@
     <button class="cbtn" id="b-chat" title="聊天">💬<small>聊天</small></button>
     <button class="cbtn leave" id="b-leave" title="离开">📞<small>离开</small></button>
   </div>
+  <div class="card drawer hidden" id="rq-panel">
+    <div class="row"><h2 class="mt0">加入申请</h2><button class="btn ghost sm nogrow" id="rq-close">关闭</button></div>
+    <ul class="list" id="rq-list"></ul>
+  </div>
 </section>
 
-<script src="/common.js?v=2"></script>
-<script src="/app.js?v=2"></script>
+<script src="/common.js?v=7"></script>
+<script src="/app.js?v=7"></script>
 </body>
 </html>

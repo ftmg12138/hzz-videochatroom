@@ -76,10 +76,11 @@ async function api(req, env, url, ctx) {
   }
   if ((p === "/api/register" || p === "/api/login") && m === "POST") {
     const b = await body(req); if (!b) return err(400, "请求格式错误");
-    const r = p === "/api/register" ? await D.register(b.username, b.password, c) : await D.login(b.username, b.password, c);
+    const r = p === "/api/register" ? await D.register(b.username, b.password, c, b.code) : await D.login(b.username, b.password, c);
     if (!r.ok) return err(r.status, r.error);
     return json({ user: r.data.user }, 200, { "Set-Cookie": cookieHeader(env, r.data.token) });
   }
+  if (p === "/api/reg-config" && m === "GET") return json(await D.regConfig());
   if (p === "/api/logout" && m === "POST") {
     if (token) await D.logout(token, c);
     return json({ ok: true }, 200, { "Set-Cookie": cookieHeader(env, null) });
@@ -87,6 +88,15 @@ async function api(req, env, url, ctx) {
   if (p === "/api/password" && m === "POST") {
     const b = await body(req); if (!b) return err(400, "请求格式错误");
     return out(await D.changePassword(token, b.oldPassword, b.newPassword, c));
+  }
+
+  if (p === "/api/avatar" && m === "POST") {
+    const b = await body(req); if (!b) return err(400, "请求格式错误");
+    return out(await D.setAvatar(token, b.avatar));
+  }
+  if (p === "/api/avatars" && m === "GET") {
+    const map = await D.avatarsFor(token, (url.searchParams.get("names") || "").split(","));
+    return map ? json({ avatars: map }) : err(401, "未登录");
   }
 
   // ICE 服务器：STUN 免费公共；若配置了 Cloudflare Realtime TURN 密钥（secret），在服务端签发短期凭据
@@ -122,7 +132,24 @@ async function api(req, env, url, ctx) {
   }
   if (p === "/api/rooms" && m === "POST") {
     const b = await body(req); if (!b) return err(400, "请求格式错误");
-    return out(await D.createRoom(token, b.number, b.password, b.name, "video", c));
+    return out(await D.createRoom(token, b.number, b.password, b.name, "video", c, b.visibility));
+  }
+  if (p === "/api/rooms/public" && m === "GET") {
+    const rows = await D.publicRooms(token, "video");
+    if (!rows) return err(401, "未登录");
+    await Promise.all(rows.slice(0, 60).map(async (r) => { try { r.online = (await vroom(env, r.number).stats()).online.length; } catch { r.online = 0; } }));
+    return json({ rooms: rows });
+  }
+  if (p === "/api/rooms/request" && m === "POST") {
+    const b = await body(req); if (!b) return err(400, "请求格式错误");
+    const r = await D.requestJoin(token, b.number, "video", c);
+    if (r.ok && r.data.created) await vroom(env, r.data.room).notifyUser(r.data.ownerId, { type: "join-request", id: r.data.id, username: r.data.username }).catch(() => {});
+    return out(r);
+  }
+  if (p === "/api/rooms/requests" && m === "GET") return out(await D.listRequests(token, url.searchParams.get("number") || "", "video"));
+  if (p === "/api/rooms/requests/decide" && m === "POST") {
+    const b = await body(req); if (!b) return err(400, "请求格式错误");
+    return out(await D.decideRequest(token, b.id, !!b.approve, c));
   }
   if (p === "/api/rooms/join" && m === "POST") {
     const b = await body(req); if (!b) return err(400, "请求格式错误");
@@ -130,7 +157,7 @@ async function api(req, env, url, ctx) {
   }
   if (p === "/api/rooms/leave" && m === "POST") {
     const b = await body(req); if (!b) return err(400, "请求格式错误");
-    await D.leaveRoom(token, b.number);
+    await D.leaveRoom(token, b.number, "video");
     return json({ ok: true });
   }
   const mm = p.match(/^\/api\/rooms\/([^/]+)\/ws$/);
@@ -142,8 +169,9 @@ async function api(req, env, url, ctx) {
     if (!acc) return err(403, "无权进入该房间，请先用房间号和密码加入");
     ctx.waitUntil(D.roomEvent("video_connect", { ...c, userId: acc.user.id, username: acc.user.username, room: acc.room.number }).catch(() => {}));
     const h = new Headers({
-      Upgrade: "websocket", "X-Uid": String(acc.user.id), "X-Username": acc.user.username, "X-Room": acc.room.number,
-      "X-Ip": c.ip, "X-Country": c.country, "X-UA": c.ua.slice(0, 300),
+      Upgrade: "websocket", "X-Uid": String(acc.user.id), "X-Username": encodeURIComponent(acc.user.username), "X-Room": acc.room.number,
+      "X-Ip": c.ip, "X-Country": c.country, "X-UA": encodeURIComponent(c.ua.slice(0, 300).replace(/[\uD800-\uDFFF]/g, "")),
+      "X-Owner": String(acc.room.creator_id ?? ""), "X-Owner-Name": encodeURIComponent(acc.room.creator_name || ""), "X-Visibility": acc.room.visibility || "private", "X-Room-Name": encodeURIComponent(acc.room.name || ""),
     });
     return vroom(env, acc.room.number).fetch("https://room/ws", { headers: h });
   }

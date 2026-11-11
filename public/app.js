@@ -2,7 +2,6 @@
   let me = null, mode = "login", rmode = "join";
   const views = ["v-auth", "v-chpw", "v-lobby", "v-perm", "v-room"];
   const show = (id) => views.forEach((v) => $("#" + v).classList.toggle("hidden", v !== id));
-  const toast = (t, ms = 2500) => { const d = document.createElement("div"); d.className = "toast"; d.textContent = t; document.body.appendChild(d); setTimeout(() => d.remove(), ms); };
 
   // ===== 路由 =====
   async function boot() {
@@ -11,6 +10,7 @@
     route();
   }
   function route() {
+    if (me) avSet(me.username, me.avatar);
     if (!me) { leaveRoom(true); show("v-auth"); return; }
     if (me.mustChange) { leaveRoom(true); $("#c-cancel").classList.add("hidden"); show("v-chpw"); return; }
     const m = location.hash.match(/^#\/room\/(.+)$/);
@@ -29,13 +29,19 @@
     $("#reg-extra").classList.toggle("hidden", mode !== "register");
     $("#a-submit").textContent = mode === "login" ? "登录" : "注册并登录";
     setMsg($("#a-msg"), "");
+    if (mode === "register") api("/api/reg-config").then((d) => $("#code-wrap").classList.toggle("hidden", !d.codeRequired)).catch(() => {});
   });
   $("#f-auth").onsubmit = (e) => {
     e.preventDefault();
     const username = $("#a-user").value.trim(), password = $("#a-pass").value;
     if (mode === "register" && password !== $("#a-pass2").value) return setMsg($("#a-msg"), "两次输入的密码不一致");
     busy($("#a-submit"), async () => {
-      try { me = (await api("/api/" + mode, { method: "POST", body: { username, password } })).user; $("#a-pass").value = $("#a-pass2").value = ""; route(); }
+      const code = $("#code-wrap").classList.contains("hidden") ? undefined : $("#a-code").value.trim();
+      try {
+        me = (await api("/api/" + mode, { method: "POST", body: { username, password, code } })).user; $("#a-pass").value = $("#a-pass2").value = "";
+        const isNew = mode === "register"; route();
+        if (isNew && me && !me.mustChange) { const u = await openAvatarPicker(me, { welcome: true }); if (u) { me = u; route(); } }
+      }
       catch (er) { setMsg($("#a-msg"), er.message); }
     });
   };
@@ -52,38 +58,94 @@
   $("#l-logout").onclick = async () => { await api("/api/logout", { method: "POST" }).catch(() => {}); me = null; location.hash = ""; route(); };
 
   // ===== 大厅 =====
+  let pubTimer = null;
   async function lobby() {
     $("#l-name").textContent = me.username;
+    $("#l-av").innerHTML = `<button class="av-me" id="l-avbtn" type="button" title="设置头像">${avatar(me.username)}</button>`;
+    $("#l-avbtn").onclick = pickAvatar;
     const ul = $("#l-rooms");
     try {
       const { rooms } = await api("/api/rooms");
-      ul.innerHTML = rooms.length ? rooms.map((r) => `<li><div><b>${esc(r.name || r.number)}</b><div class="sub">房间号 ${esc(r.number)} · 创建者 ${esc(r.creator_name || "—")}</div></div>
+      $("#l-rooms-n").textContent = rooms.length;
+      ul.innerHTML = rooms.length ? rooms.map((r) => `<li><div class="row"><span class="ico-room v">${r.visibility === "public" ? "🌿" : "🎥"}</span><div><div class="title">${esc(r.name || r.number)}</div><div class="sub">房间号 ${esc(r.number)} · 房主 ${esc(r.creator_name || "—")}</div></div></div>
         <div class="row nogrow"><a class="btn sm" href="#/room/${encodeURIComponent(r.number)}">进入</a><button class="btn ghost sm" data-leave="${esc(r.number)}">移除</button></div></li>`).join("")
-        : `<li class="empty">还没有视频房间。创建一个，或用房间号和密码加入。</li>`;
+        : `<li class="empty">还没有视频房间。创建一个，或用房间号和密码加入 ✨</li>`;
       $$("[data-leave]", ul).forEach((b) => b.onclick = async () => {
-        if (!confirm("从列表移除该房间？之后再进需要重新输入房间密码。")) return;
+        if (!confirm("从列表移除该房间？之后再进需要重新输入房间密码或重新申请。")) return;
         await api("/api/rooms/leave", { method: "POST", body: { number: b.dataset.leave } }); lobby();
       });
-    } catch (er) { if (er.status === 401) { me = null; route(); } }
+    } catch (er) { if (er.status === 401) { me = null; route(); return; } }
+    publicRooms();
+  }
+  async function pickAvatar() { const u = await openAvatarPicker(me); if (u) { me = u; lobby(); } }
+  $("#l-avatar").onclick = pickAvatar;
+  async function publicRooms() {
+    clearTimeout(pubTimer);
+    if ($("#v-lobby").classList.contains("hidden")) return;
+    try {
+      const { rooms } = await api("/api/rooms/public");
+      $("#l-pub-n").textContent = rooms.length;
+      $("#l-pub").innerHTML = rooms.length ? rooms.map((r) => `<div class="room-card">
+          <div class="rc-top"><span class="ico-room v">🎥</span><div class="col"><div class="rc-name">${esc(r.name || r.number)}</div><div class="sub">房间号 ${esc(r.number)} · <span class="tag vid">视频</span></div></div></div>
+          <div class="rc-meta"><span><span class="live-dot"></span>${r.online || 0}/4 人在线</span><span>👤 房主 ${esc(r.creator_name || "—")}</span></div>
+          ${r.member ? `<a class="btn sm" href="#/room/${encodeURIComponent(r.number)}">进入</a>`
+            : r.pending ? `<button class="btn soft sm" disabled>已申请，等待房主同意</button>`
+            : `<button class="btn soft sm" data-req="${esc(r.number)}">申请加入</button>`}
+        </div>`).join("") : `<div class="empty">还没有公开视频房间。创建房间时选「公开」，就会出现在这里。</div>`;
+      $$("[data-req]").forEach((b) => b.onclick = () => busy(b, async () => {
+        try { const d = await api("/api/rooms/request", { method: "POST", body: { number: b.dataset.req } }); if (d.member) location.hash = "#/room/" + encodeURIComponent(b.dataset.req); else { toast("已发送申请，房主同意后即可进入"); publicRooms(); } }
+        catch (er) { toast(er.message); }
+      }));
+      if (rooms.some((r) => r.pending)) pubTimer = setTimeout(() => { if (!$("#v-lobby").classList.contains("hidden")) lobby(); }, 5000);
+    } catch {}
   }
   $$("[data-rtab]").forEach((b) => b.onclick = () => {
     rmode = b.dataset.rtab;
     $$("[data-rtab]").forEach((x) => x.classList.toggle("on", x === b));
     $("#r-create-extra").classList.toggle("hidden", rmode !== "create");
+    $("#r-vis-wrap").classList.toggle("hidden", rmode !== "create");
     $("#r-submit").textContent = rmode === "join" ? "加入" : "创建并进入";
-    setMsg($("#r-msg"), "");
+    visHint(); setMsg($("#r-msg"), "");
   });
+  const vis = () => (document.querySelector('input[name="r-vis"]:checked') || {}).value || "private";
+  function visHint() {
+    const pub = rmode === "create" && vis() === "public";
+    $("#r-pass-label").textContent = pub ? "房间密码（可选）" : "房间密码";
+    $("#r-pass").placeholder = pub ? "留空则只能申请加入；设置后也可凭密码直接进" : "4–64 位";
+  }
+  $$('input[name="r-vis"]').forEach((x) => x.onchange = visHint);
   $("#f-room").onsubmit = (e) => {
     e.preventDefault();
     const number = $("#r-num").value.trim(), password = $("#r-pass").value, name = $("#r-name").value.trim();
     busy($("#r-submit"), async () => {
       try {
-        const { room } = await api(rmode === "join" ? "/api/rooms/join" : "/api/rooms", { method: "POST", body: { number, password, name } });
+        const { room } = await api(rmode === "join" ? "/api/rooms/join" : "/api/rooms", { method: "POST", body: { number, password, name, visibility: vis() } });
         $("#r-pass").value = ""; setMsg($("#r-msg"), "");
         location.hash = "#/room/" + encodeURIComponent(room.number);
       } catch (er) { setMsg($("#r-msg"), er.message); }
     });
   };
+
+  // ===== 房主：处理加入申请 =====
+  let isOwner = false;
+  async function loadRequests() {
+    if (!isOwner || !R.room) return;
+    try {
+      const { rows } = await api("/api/rooms/requests?number=" + encodeURIComponent(R.room));
+      const n = $("#rq-n"); n.textContent = rows.length; n.classList.toggle("hidden", !rows.length);
+      $("#rq-list").innerHTML = rows.length ? rows.map((r) => `<li><div class="row">${avatar(r.username, true)}<div><b>${esc(r.username)}</b><div class="sub">${esc(timeShort(r.created_at))} 申请</div></div></div>
+        <div class="row nogrow"><button class="btn ok sm" data-ok="${r.id}">同意</button><button class="btn ghost sm" data-no="${r.id}">拒绝</button></div></li>`).join("") : `<li class="empty">暂时没有新的申请</li>`;
+    } catch {}
+  }
+  $("#rq-btn").onclick = () => { $("#rq-panel").classList.toggle("hidden"); loadRequests(); };
+  $("#rq-close").onclick = () => $("#rq-panel").classList.add("hidden");
+  $("#rq-list").onclick = async (e) => {
+    const b = e.target.closest("[data-ok],[data-no]"); if (!b) return;
+    try { const d = await api("/api/rooms/requests/decide", { method: "POST", body: { id: Number(b.dataset.ok || b.dataset.no), approve: !!b.dataset.ok } }); toast(d.status === "approved" ? `已同意 ${d.username}` : `已拒绝 ${d.username}`); }
+    catch (er) { toast(er.message); }
+    loadRequests();
+  };
+  $("#vr-back").onclick = () => { location.hash = ""; };
 
   // ===== 设备权限 =====
   const R = { room: null, pending: null, ws: null, myId: null, peers: new Map(), local: null, mic: null, cam: null, screen: null,
@@ -131,7 +193,8 @@
     $("#vr-grid").innerHTML = ""; $("#vr-msgs").innerHTML = "";
     $("#vr-title").textContent = "视频房间 " + number;
     show("v-room");
-    addTile("local", me.username + "（我）", true);
+    addTile("local", me.username + "（我）", true, me.username);
+    isOwner = false; $("#rq-btn").classList.add("hidden"); $("#rq-panel").classList.add("hidden");
     updateLocalTile(); updateButtons();
     try { R.ice = (await api("/api/ice")).iceServers; } catch { R.ice = [{ urls: "stun:stun.cloudflare.com:3478" }]; }
     connect();
@@ -167,7 +230,8 @@
     switch (m.type) {
       case "welcome":
         R.myId = m.you;
-        $("#vr-title").textContent = "视频房间 " + m.room;
+        $("#vr-title").textContent = (m.visibility === "public" ? "🌿 " : "🎥 ") + (m.name || "视频房间 " + m.room);
+        isOwner = !!m.isOwner; $("#rq-btn").classList.toggle("hidden", !isOwner); if (isOwner) loadRequests();
         m.history.forEach(addChat);
         sendState();
         for (const p of m.peers) { const peer = createPeer(p.peerId, p.username, true); applyState(peer, p.state); }
@@ -183,6 +247,7 @@
       case "chat-cleared": $("#vr-msgs").innerHTML = ""; addSys("管理员清空了聊天记录"); break;
       case "kicked": R.wantClose = true; alert(m.reason); location.hash = ""; break;
       case "error": toast(m.error); break;
+      case "join-request": toast(`${m.username} 申请加入房间`); loadRequests(); break;
     }
   }
 
@@ -263,16 +328,16 @@
   }
 
   // ----- 画面 -----
-  function addTile(id, name, local) {
+  function addTile(id, name, local, uname = name) {
     const d = document.createElement("div");
     d.className = "tile" + (local ? " local" : "");
     d.dataset.peer = id;
     d.innerHTML = `<video autoplay playsinline ${local ? "muted" : ""}></video>
-      <div class="off hidden"><div class="av"></div></div>
+      <div class="off hidden">${avatar(uname)}</div>
       <div class="conn ${local ? "hidden" : ""}">连接中</div>
       <div class="name"><b class="mic"></b><span></span></div>`;
     d.querySelector(".name span").textContent = name;
-    d.querySelector(".av").textContent = (name || "?").slice(0, 1).toUpperCase();
+    d.querySelector(".name").insertAdjacentHTML("afterbegin", avatar(uname, true));
     $("#vr-grid").appendChild(d);
     layout();
     return d;
@@ -294,7 +359,7 @@
   function updateButtons() {
     const mic = $("#b-mic"), cam = $("#b-cam");
     mic.classList.toggle("off", !(R.mic && R.micOn)); mic.innerHTML = (R.mic && R.micOn ? "🎙️" : "🔇") + `<small>${R.mic ? (R.micOn ? "静音" : "取消静音") : "开麦"}</small>`;
-    cam.classList.toggle("off", !(R.cam && R.camOn)); cam.innerHTML = "📷" + `<small>${R.cam ? (R.camOn ? "关摄像头" : "开摄像头") : "开摄像头"}</small>`;
+    cam.classList.toggle("off", !(R.cam && R.camOn)); cam.innerHTML = "📷" + `<small>${R.cam ? (R.camOn ? "关摄像" : "开摄像") : "开摄像"}</small>`;
     $("#b-screen").classList.toggle("on", !!R.screen);
     $("#b-screen").classList.toggle("hidden", !navigator.mediaDevices.getDisplayMedia || /Android|iPhone|iPad/i.test(navigator.userAgent));
     $("#b-chat").innerHTML = `💬<small>聊天</small>${R.unread ? `<span class="badge">${R.unread}</span>` : ""}`;
@@ -371,7 +436,7 @@
     const d = document.createElement("div");
     const mine = m.username === me.username;
     d.className = "bubble" + (mine ? " me" : ""); d.dataset.id = m.id;
-    d.innerHTML = `<div class="meta">${mine ? "" : esc(m.username) + " · "}${esc(timeShort(m.ts))}</div><div class="txt"></div>`;
+    d.innerHTML = `${avatar(m.username, true)}<div><div class="meta">${mine ? "" : esc(m.username) + " · "}${esc(timeShort(m.ts))}</div><div class="txt"></div></div>`;
     d.querySelector(".txt").textContent = m.text;
     $("#vr-msgs").appendChild(d); scrollChat();
   }

@@ -36,11 +36,11 @@ export class VideoRoom extends DurableObject {
   async fetch(request) {
     if (request.headers.get("Upgrade") !== "websocket") return new Response("expected websocket", { status: 426 });
     const uid = Number(request.headers.get("X-Uid"));
-    const username = request.headers.get("X-Username");
+    const username = decodeURIComponent(request.headers.get("X-Username") || "");
     const room = request.headers.get("X-Room");
     const ip = request.headers.get("X-Ip") || "";
     const country = request.headers.get("X-Country") || "";
-    const ua = request.headers.get("X-UA") || "";
+    const ua = decodeURIComponent(request.headers.get("X-UA") || "");
     const max = Number(this.env.MAX_PEERS || 4);
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -54,7 +54,10 @@ export class VideoRoom extends DurableObject {
     const peerId = crypto.randomUUID().slice(0, 8);
     const existing = this.peers().map((p) => ({ peerId: p.a.peerId, username: p.a.username, state: p.a.state || {} }));
     server.serializeAttachment({ uid, username, ip, country, ua, room, peerId, state: { audio: true, video: true, screen: false }, joinedAt: Date.now() });
-    this.send(server, { type: "welcome", room, you: peerId, me: username, peers: existing, history: this.history(), max });
+    const ownerId = Number(request.headers.get("X-Owner")) || null;
+    this.send(server, { type: "welcome", room, you: peerId, me: username, peers: existing, history: this.history(), max,
+      owner: decodeURIComponent(request.headers.get("X-Owner-Name") || ""), isOwner: ownerId === uid, visibility: request.headers.get("X-Visibility") || "private",
+      name: decodeURIComponent(request.headers.get("X-Room-Name") || "") });
     this.broadcast({ type: "peer-join", peerId, username }, peerId);
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -115,11 +118,17 @@ export class VideoRoom extends DurableObject {
   dir() { return this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("main")); }
 
   // ---------- 管理 RPC（与 ChatRoom 同名，供 chatroom 后台调用） ----------
-  async adminMessages(limit = 300) {
-    return this.sql.exec("SELECT id, ts, username, text, ip, kind FROM messages ORDER BY id DESC LIMIT ?", Math.min(limit, 1000)).toArray();
+  async adminMessages(limit = 300, afterId = 0) {
+    return this.sql.exec("SELECT id, ts, username, text, ip, kind FROM messages WHERE id > ? ORDER BY id DESC LIMIT ?", Number(afterId) || 0, Math.min(limit, 1000)).toArray();
   }
   async stats() {
-    return { messages: this.sql.exec("SELECT COUNT(*) AS n FROM messages").one().n, online: this.online() };
+    const members = this.peers().map((p) => ({ uid: p.a.uid, username: p.a.username, ip: p.a.ip, country: p.a.country, video: !!p.a.state?.video, audio: !!p.a.state?.audio, screen: !!p.a.state?.screen }));
+    return { messages: this.sql.exec("SELECT COUNT(*) AS n FROM messages").one().n, lastMsgAt: this.sql.exec("SELECT MAX(ts) AS t FROM messages").one().t || null,
+             online: this.online(), video: members.map((m) => m.username), members };
+  }
+  async notifyUser(uid, obj) {
+    for (const ws of this.ctx.getWebSockets(`u:${uid}`)) this.send(ws, obj);
+    return true;
   }
   async deleteMessage(id) {
     this.sql.exec("DELETE FROM messages WHERE id=?", Number(id));
