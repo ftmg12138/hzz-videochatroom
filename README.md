@@ -16,6 +16,7 @@
 - wrangler 绑定：`DIRECTORY` → `Directory`（script_name = "chatroom"）
 - chatroom 反向绑定：`VROOMS` → `VideoRoom`（script_name = "videochatroom"），后台据此查看/清空视频房间聊天、踢人、删除视频房间
 - 同一 Cookie `hzz_sid`（Domain=xyzhzz.com），两站登录互通；视频和文字房间号**各自独立**（同号可并存，按 kind + number 区分）
+- 房主关闭房间：顶栏「⛔ 关闭房间」→ 确认 → `POST /api/rooms/close {number}`（仅房主/管理员），删除房间并踢出所有人（立即退出声网频道），详见 chatroom README；测试在 `../chatroom/test/close-room.mjs`
 - 公开 / 私密房间、加入申请（房主在视频房间顶部 📨 处理）、头像（视频格子、聊天、大厅）、注册口令与 chatroom 一致，详见 chatroom README
 - 日志事件：`video_request`、`video_request_approve`、`video_request_reject`、`video_visit`、`video_room_create`、`video_join`、`video_join_fail`、`video_join_limited`、`video_connect`、`video_leave`（均带 IP/国家/UA），后台日志可按「仅视频」筛选
 - 首次部署顺序：chatroom（不带 VROOMS）→ videochatroom → chatroom（带 VROOMS）。之后各自独立部署即可。

@@ -199,6 +199,13 @@ async function api(req, env, url, ctx) {
     const b = await body(req); if (!b) return err(400, "请求格式错误");
     return out(await D.joinRoom(token, b.number, b.password, c, "video"));
   }
+  if (p === "/api/rooms/close" && m === "POST") {
+    // 房主（或管理员）关闭房间：删除登记，踢出所有人（前端收到后立即退出声网频道）
+    const b = await body(req); if (!b) return err(400, "请求格式错误");
+    const r = await D.closeRoom(token, b.number, "video", c);
+    if (r.ok) await vroom(env, r.data.number).destroy(r.data.byOwner ? "房主已关闭房间" : "房间已被管理员关闭", true);
+    return out(r);
+  }
   if (p === "/api/rooms/leave" && m === "POST") {
     const b = await body(req); if (!b) return err(400, "请求格式错误");
     await D.leaveRoom(token, b.number, "video");

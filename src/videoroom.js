@@ -166,9 +166,9 @@ export class VideoRoom extends DurableObject {
     }
     return true;
   }
-  async destroy() {
+  async destroy(reason = "房间已被管理员删除", closed = false) {
     for (const ws of this.ctx.getWebSockets()) {
-      this.send(ws, { type: "kicked", reason: "房间已被管理员删除" });
+      this.send(ws, { type: "kicked", reason, closed });
       this.left(ws);
       try { ws.close(4004, "room deleted"); } catch {}
     }
