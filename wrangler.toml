@@ -17,7 +17,7 @@ name = "DIRECTORY"
 class_name = "Directory"
 script_name = "chatroom"
 
-# 每个视频房间一个：WebRTC 信令 + 房间内文字聊天
+# 每个视频房间一个：成员/声网 Token + 房间内文字聊天
 [[durable_objects.bindings]]
 name = "VROOMS"
 class_name = "VideoRoom"

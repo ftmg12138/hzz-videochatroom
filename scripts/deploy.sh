@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 部署 Worker「videochatroom」→ https://videochatroom.xyzhzz.com
 # 依赖：chatroom Worker 已部署（这里通过 script_name 绑定它的 Directory DO）。需要 CLOUDFLARE_API_TOKEN。
-# TURN（可选）：见 README「NAT 穿透」——Cloudflare / Metered / 自建 coturn / 固定账号，均通过 Worker secret 配置。
+# 音视频走声网：需要 Worker secret AGORA_APP_ID / AGORA_APP_CERTIFICATE（见 README「音视频」）。
 set -euo pipefail
 : "${CLOUDFLARE_API_TOKEN:?请先设置 CLOUDFLARE_API_TOKEN}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -14,7 +14,7 @@ git remote get-url origin >/dev/null 2>&1 || git remote add origin "$EXPECTED"
 
 git add -A
 leak=0
-for v in CHATROOM_GITHUB_TOKEN GITHUB_BACKUP_TOKEN CLOUDFLARE_API_TOKEN; do
+for v in CHATROOM_GITHUB_TOKEN GITHUB_BACKUP_TOKEN CLOUDFLARE_API_TOKEN AGORA_APP_CERTIFICATE; do
   val="${!v:-}"
   [ -n "$val" ] && git grep -q --cached -F -e "$val" && { echo "暂存区中发现 $v 的值，已中止" >&2; leak=1; }
 done

@@ -1,11 +1,13 @@
 // VideoRoom：每个视频房间一个 Durable Object。
-// 负责 WebRTC 信令转发（offer/answer/ICE）、成员进出、媒体状态广播、房间内文字聊天（SQLite 持久化）。
-// 媒体本身走浏览器点对点（mesh），不经过服务器。
+// 负责成员进出（含每人的声网 uid）、签发声网 RTC Token、媒体状态广播、房间内文字聊天（SQLite 持久化）。
+// 音视频本身走声网 Agora RTC（见 public/app.js），不再浏览器点对点直连。
 import { DurableObject } from "cloudflare:workers";
+import { buildRtcToken, channelFor } from "./agora.js";
 
 const MAX_LEN = 1000;
 const HISTORY = 50;
 const KEEP = 2000;
+export const RTC_TTL = 2 * 3600; // 声网 Token 有效期（秒）；客户端在过期前 30 秒经 WebSocket 续期
 
 export class VideoRoom extends DurableObject {
   constructor(ctx, env) {
@@ -52,13 +54,16 @@ export class VideoRoom extends DurableObject {
       return new Response(null, { status: 101, webSocket: client });
     }
     const peerId = crypto.randomUUID().slice(0, 8);
-    const existing = this.peers().map((p) => ({ peerId: p.a.peerId, username: p.a.username, state: p.a.state || {} }));
-    server.serializeAttachment({ uid, username, ip, country, ua, room, peerId, state: { audio: true, video: true, screen: false }, joinedAt: Date.now() });
+    // 声网 uid：每个连接一个，由服务器分配（客户端无法冒用别人的 uid），用于把声网的远端画面对应到用户名/头像
+    const used = new Set(this.peers().map((p) => p.a.rtcUid));
+    let rtcUid; do { rtcUid = (crypto.getRandomValues(new Uint32Array(1))[0] & 0x7fffffff) || 1; } while (used.has(rtcUid));
+    const existing = this.peers().map((p) => ({ peerId: p.a.peerId, username: p.a.username, rtcUid: p.a.rtcUid, state: p.a.state || {} }));
+    server.serializeAttachment({ uid, username, ip, country, ua, room, peerId, rtcUid, state: { audio: true, video: true, screen: false }, joinedAt: Date.now() });
     const ownerId = Number(request.headers.get("X-Owner")) || null;
-    this.send(server, { type: "welcome", room, you: peerId, me: username, peers: existing, history: this.history(), max,
+    this.send(server, { type: "welcome", room, you: peerId, me: username, rtcUid, rtc: await this.rtcFor(room, rtcUid), peers: existing, history: this.history(), max,
       owner: decodeURIComponent(request.headers.get("X-Owner-Name") || ""), isOwner: ownerId === uid, visibility: request.headers.get("X-Visibility") || "private",
       name: decodeURIComponent(request.headers.get("X-Room-Name") || "") });
-    this.broadcast({ type: "peer-join", peerId, username }, peerId);
+    this.broadcast({ type: "peer-join", peerId, username, rtcUid }, peerId);
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -69,12 +74,9 @@ export class VideoRoom extends DurableObject {
     let m; try { m = JSON.parse(raw); } catch { return; }
     switch (m.type) {
       case "ping": this.send(ws, { type: "pong" }); return;
-      case "signal": {
-        // 只转发给同房间的目标 peer；附上发送者身份（由服务器填写，客户端无法伪造）
-        const target = this.peers().find((p) => p.a.peerId === m.to);
-        if (target) this.send(target.ws, { type: "signal", from: a.peerId, username: a.username, data: m.data });
+      case "rtc-renew": // 声网 Token 即将过期：只给仍在房间里的连接续签
+        this.send(ws, { type: "rtc-token", rtc: await this.rtcFor(a.room, a.rtcUid) });
         return;
-      }
       case "state": {
         a.state = { audio: !!m.audio, video: !!m.video, screen: !!m.screen };
         ws.serializeAttachment(a);
@@ -117,12 +119,28 @@ export class VideoRoom extends DurableObject {
   }
   dir() { return this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("main")); }
 
+  // 声网 RTC 参数：App ID（公开）、频道名、uid、Token。证书只在服务端使用。
+  async rtcFor(room, rtcUid) {
+    if (!this.env.AGORA_APP_ID || !this.env.AGORA_APP_CERTIFICATE) return { error: "视频服务未配置（缺少声网 App ID / 证书）" };
+    try {
+      const channel = await channelFor(room);
+      const token = await buildRtcToken(this.env.AGORA_APP_ID, this.env.AGORA_APP_CERTIFICATE, channel, rtcUid, RTC_TTL);
+      return { appId: this.env.AGORA_APP_ID, channel, uid: rtcUid, token, expiresIn: RTC_TTL };
+    } catch (e) { return { error: "视频服务配置错误：" + (e && e.message) }; }
+  }
+  // 供 /api/rooms/:n/rtc-token 调用：只给该用户当前在线的连接签发（peerId 可选，用于同一账号多设备）
+  async rtcTokenFor(userId, peerId) {
+    const p = this.peers().find((x) => x.a.uid === Number(userId) && (!peerId || x.a.peerId === peerId));
+    if (!p) return null;
+    return this.rtcFor(p.a.room, p.a.rtcUid);
+  }
+
   // ---------- 管理 RPC（与 ChatRoom 同名，供 chatroom 后台调用） ----------
   async adminMessages(limit = 300, afterId = 0) {
     return this.sql.exec("SELECT id, ts, username, text, ip, kind FROM messages WHERE id > ? ORDER BY id DESC LIMIT ?", Number(afterId) || 0, Math.min(limit, 1000)).toArray();
   }
   async stats() {
-    const members = this.peers().map((p) => ({ uid: p.a.uid, username: p.a.username, ip: p.a.ip, country: p.a.country, video: !!p.a.state?.video, audio: !!p.a.state?.audio, screen: !!p.a.state?.screen }));
+    const members = this.peers().map((p) => ({ uid: p.a.uid, rtcUid: p.a.rtcUid, username: p.a.username, ip: p.a.ip, country: p.a.country, video: !!p.a.state?.video, audio: !!p.a.state?.audio, screen: !!p.a.state?.screen }));
     return { messages: this.sql.exec("SELECT COUNT(*) AS n FROM messages").one().n, lastMsgAt: this.sql.exec("SELECT MAX(ts) AS t FROM messages").one().t || null,
              online: this.online(), video: members.map((m) => m.username), members };
   }

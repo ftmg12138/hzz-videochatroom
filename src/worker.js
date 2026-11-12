@@ -34,13 +34,14 @@ const dir = (env) => env.DIRECTORY.get(env.DIRECTORY.idFromName("main"));
 const vroom = (env, n) => env.VROOMS.get(env.VROOMS.idFromName(String(n).toLowerCase()));
 const out = (r) => (r.ok ? json(r.data) : err(r.status, r.error));
 
+// 声网 SDK 需要连接其动态分配的网关/边缘节点（https/wss，域名和 IP 不固定），并会给自己创建的隐藏元素写内联样式
 const SECURITY_HEADERS = {
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
   "Referrer-Policy": "same-origin",
   "Strict-Transport-Security": "max-age=31536000",
   "Permissions-Policy": "camera=(self), microphone=(self), display-capture=(self), geolocation=()",
-  "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob: mediastream:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: mediastream:; connect-src 'self' https: wss:; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
 };
 
 // stun.miwifi.com（小米）在国内可达；Google STUN 在国内基本不可用，只作海外兜底
@@ -202,6 +203,19 @@ async function api(req, env, url, ctx) {
     const b = await body(req); if (!b) return err(400, "请求格式错误");
     await D.leaveRoom(token, b.number, "video");
     return json({ ok: true });
+  }
+  // 声网 RTC Token（续期 / 调试用；进房时 WebSocket 的 welcome 里已经带了一个）：必须已凭密码加入该房间，且当前在房间里
+  const mt = p.match(/^\/api\/rooms\/([^/]+)\/rtc-token$/);
+  if (mt && m === "POST") {
+    const user = await D.getSession(token);
+    if (!user) return err(401, "未登录");
+    const acc = await D.checkRoomAccess(token, decodeURIComponent(mt[1]), "video");
+    if (!acc) return err(403, "无权进入该房间，请先用房间号和密码加入");
+    const b = (await body(req)) || {};
+    const rtc = await vroom(env, acc.room.number).rtcTokenFor(acc.user.id, typeof b.peerId === "string" ? b.peerId : null);
+    if (!rtc) return err(409, "请先进入房间");
+    if (rtc.error) return err(503, rtc.error);
+    return json(rtc);
   }
   const mm = p.match(/^\/api\/rooms\/([^/]+)\/ws$/);
   if (mm && m === "GET") {

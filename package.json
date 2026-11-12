@@ -7,8 +7,8 @@
     "test:e2e": "node test/e2e.mjs"
   },
   "devDependencies": {
+    "agora-token": "^2.0.7",
     "playwright-core": "1.48.2",
-    "werift": "^0.19.9",
     "wrangler": "4.30.0",
     "ws": "^8.18.0"
   }
