@@ -150,6 +150,16 @@
     } catch {}
   }
   // 房主关闭房间：确认后调用 /api/rooms/close，服务器会把房间里所有人（包括自己）踢回大厅
+  // 保留房间（房主 / 管理员）：开启后不自动关闭；取消后重新计时
+  $("#keep-btn").onclick = async () => {
+    if (!R.room || !R.canManage) return;
+    const want = !(R.idle && R.idle.keep);
+    try {
+      const d = await api("/api/rooms/keep", { method: "POST", body: { number: R.room, keep: want } });
+      R.idle = { ...R.idle, keep: d.keep, idleAt: d.idleAt, idleMs: d.idleMs || R.idle?.idleMs }; roomIdleUI(R.idle, R.canManage);
+      toast(want ? "已保留房间，不会自动关闭" : `已取消保留：在线不足 2 人持续 ${Math.round((R.idle.idleMs || 600000) / 60000)} 分钟会自动关闭`);
+    } catch (er) { toast(er.message); }
+  };
   $("#close-room-btn").onclick = async () => {
     const n = R.room; if (!n || !isOwner) return;
     const yes = await confirmDialog({ title: "关闭房间？", text: `房间「${n}」会被删除，房间里的所有人会被移出并回到大厅，聊天记录一并清除，此操作不能撤销。`, ok: "关闭房间" });
@@ -216,7 +226,7 @@
     $("#vr-title").textContent = "视频房间 " + number;
     show("v-room");
     addTile("local", me.username + "（我）", true, me.username);
-    isOwner = false; $("#rq-btn").classList.add("hidden"); $("#close-room-btn").classList.add("hidden"); $("#rq-panel").classList.add("hidden");
+    isOwner = false; $("#rq-btn").classList.add("hidden"); $("#close-room-btn").classList.add("hidden"); R.canManage = false; R.idle = {}; roomIdleUI({}, false); $("#rq-panel").classList.add("hidden");
     updateLocalTile(); updateButtons();
     connect();
   }
@@ -253,6 +263,7 @@
         R.myId = m.you; R.rtcUid = m.rtcUid;
         $("#vr-title").textContent = (m.visibility === "public" ? "🌿 " : "🎥 ") + (m.name || "视频房间 " + m.room);
         isOwner = !!m.isOwner; $("#rq-btn").classList.toggle("hidden", !isOwner); $("#close-room-btn").classList.toggle("hidden", !isOwner); if (isOwner) loadRequests();
+        R.canManage = isOwner || !!m.isAdmin; R.idle = { keep: m.keep, idleAt: m.idleAt, idleMs: m.idleMs }; roomIdleUI(R.idle, R.canManage);
         m.history.forEach(addChat);
         sendState();
         for (const p of m.peers) { const peer = createPeer(p.peerId, p.username, p.rtcUid); applyState(peer, p.state); }
@@ -275,6 +286,7 @@
         R.wantClose = true; stopRtc(true); // 立即退出声网频道
         if (m.closed) { if (!R.closingSelf) toast(m.reason, 5000); } else alert(m.reason);
         location.hash = ""; break;
+      case "room-idle": R.idle = { ...R.idle, keep: m.keep, idleAt: m.idleAt }; roomIdleUI(R.idle, R.canManage); break;
       case "error": toast(m.error); break;
       case "join-request": toast(`${m.username} 申请加入房间`); loadRequests(); break;
     }

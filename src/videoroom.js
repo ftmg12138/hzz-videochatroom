@@ -3,13 +3,14 @@
 // 音视频本身走声网 Agora RTC（见 public/app.js），不再浏览器点对点直连。
 import { DurableObject } from "cloudflare:workers";
 import { buildRtcToken, channelFor } from "./agora.js";
+import { withIdle } from "./idle.js";
 
 const MAX_LEN = 1000;
 const HISTORY = 50;
 const KEEP = 2000;
 export const RTC_TTL = 2 * 3600; // 声网 Token 有效期（秒）；客户端在过期前 30 秒经 WebSocket 续期
 
-export class VideoRoom extends DurableObject {
+class VideoRoomBase extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
@@ -19,8 +20,10 @@ export class VideoRoom extends DurableObject {
   init() {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, user_id INTEGER, username TEXT,
-      text TEXT NOT NULL, ip TEXT, kind TEXT NOT NULL DEFAULT 'msg');`);
+      text TEXT NOT NULL, ip TEXT, kind TEXT NOT NULL DEFAULT 'msg');
+      CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);`);
   }
+  presentUids(exceptWs) { return new Set(this.peers().filter((p) => p.ws !== exceptWs).map((p) => p.a.uid)); }
   peers() {
     return this.ctx.getWebSockets().filter((ws) => ws.readyState === 1)
       .map((ws) => ({ ws, a: ws.deserializeAttachment() || {} })).filter((p) => p.a.peerId);
@@ -59,8 +62,11 @@ export class VideoRoom extends DurableObject {
     let rtcUid; do { rtcUid = (crypto.getRandomValues(new Uint32Array(1))[0] & 0x7fffffff) || 1; } while (used.has(rtcUid));
     const existing = this.peers().map((p) => ({ peerId: p.a.peerId, username: p.a.username, rtcUid: p.a.rtcUid, state: p.a.state || {} }));
     server.serializeAttachment({ uid, username, ip, country, ua, room, peerId, rtcUid, state: { audio: true, video: true, screen: false }, joinedAt: Date.now() });
+    this.kvSet("room", room); this.kvSet("keep", request.headers.get("X-Keep") === "1" ? "1" : "0");
+    await this.idleCheck();
     const ownerId = Number(request.headers.get("X-Owner")) || null;
     this.send(server, { type: "welcome", room, you: peerId, me: username, rtcUid, rtc: await this.rtcFor(room, rtcUid), peers: existing, history: this.history(), max,
+      ...this.idleState(), isAdmin: request.headers.get("X-Admin") === "1",
       owner: decodeURIComponent(request.headers.get("X-Owner-Name") || ""), isOwner: ownerId === uid, visibility: request.headers.get("X-Visibility") || "private",
       name: decodeURIComponent(request.headers.get("X-Room-Name") || "") });
     this.broadcast({ type: "peer-join", peerId, username, rtcUid }, peerId);
@@ -103,8 +109,9 @@ export class VideoRoom extends DurableObject {
   async webSocketClose(ws, code) {
     try { ws.close(code === 1005 || code === 1006 ? 1000 : code, "bye"); } catch {}
     this.left(ws);
+    await this.idleCheck(ws);
   }
-  async webSocketError(ws) { this.left(ws); }
+  async webSocketError(ws) { this.left(ws); await this.idleCheck(ws); }
   left(ws) {
     const a = ws.deserializeAttachment() || {};
     if (!a.peerId || a.leftLogged) return;
@@ -164,6 +171,7 @@ export class VideoRoom extends DurableObject {
       this.left(ws);
       try { ws.close(4003, "kicked"); } catch {}
     }
+    await this.idleCheck();
     return true;
   }
   async destroy(reason = "房间已被管理员删除", closed = false) {
@@ -172,8 +180,10 @@ export class VideoRoom extends DurableObject {
       this.left(ws);
       try { ws.close(4004, "room deleted"); } catch {}
     }
+    await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.deleteAll();
     this.init();
     return true;
   }
 }
+export const VideoRoom = withIdle(VideoRoomBase, "video");
